@@ -4,7 +4,7 @@
 > sharded Redis, which was how you built a Redis cluster before Redis Cluster was
 > production-ready. That era is over, and this code has not been maintained since 2016.
 > It is preserved for the technique documented below, which is still useful — see
-> [Reviving the idea](#reviving-the-idea).
+> [Porting this to Redis Cluster](#porting-this-to-redis-cluster).
 
 Originally built at if(we) to drive a fleet of md5-sharded Redis instances behind
 twemproxy. It reimplements twemproxy's key distribution in Python so application
@@ -73,22 +73,47 @@ Redis Cluster has no equivalent. It gives you hash tags, but it does not give yo
 a stable way to enumerate "one key per node," because node membership changes with
 resharding.
 
-## Reviving the idea
+## Porting this to Redis Cluster
 
 The technique generalizes to Redis Cluster and Valkey, but **not** in the obvious
-way. The naive port — compute one canonical key per *node* — is genuinely unsafe:
-slot ownership moves during resharding, and a node that gains slots but no canonical
-key is silently blind. Simulating random resharding events, the per-node approach
-loses coverage on **96.7%** of topology changes.
+way. Recording the trap here, since it is the one thing in this repository still
+worth knowing.
 
-The fix is to pin canonical keys to *slots* rather than nodes. There are exactly
-16384 slots, the CRC16 that maps keys to them is frozen by the cluster spec, and
-Redis migrates keys along with their slot. Precompute one canonical tag per slot —
-a permanent 16384-entry table — and coverage becomes a structural guarantee rather
-than something you hope survives the next reshard.
+**Do not port it as one canonical key per node.** It fails for two independent
+reasons.
 
-See `SPEC.md` in the successor project for the full design, the generated slot
-table, and the correctness argument.
+*It cannot do set operations.* Redis Cluster rejects multi-key commands unless the
+keys are in the same **slot** — not the same node, the same *slot*. Co-residency is
+irrelevant; the slot is the unit of migration, so the check is on the slot number.
+This is precisely where the twemproxy intuition breaks: here a shard was a whole
+Redis instance, so landing two keys on the same shard was enough to `SINTER` them.
+Under Redis Cluster it is not. Tested on a live 3-node cluster, a per-node canonical
+key that landed on the *same node* as the target key still failed:
+
+```
+SINTER subs:{1234567890} active:{<per-node canonical>}
+(error) CROSSSLOT Keys in request don't hash to the same slot
+```
+
+Same failure inside `EVAL`, `SDIFF`, `SUNION`, `SINTERSTORE`.
+
+*It does not survive resharding.* Slot ownership moves, and Redis migrates keys
+along with their slot — so the set of *slots* holding a copy is invariant, but the
+set of *nodes* is not. A node that gains slots but no canonical key serves empty
+reads, silently. Over 2000 simulated reshard events, per-node fanout lost coverage
+on **96.7%** of topology changes.
+
+**Pin canonical keys to slots instead.** There are exactly 16384 slots, and the
+CRC16 that maps keys to them is frozen by the cluster spec, so the table is a
+permanent constant — compute the lowest integer tag landing in each slot once and
+commit it. Then `prefix:{TABLE[HASH_SLOT(k)]}` is guaranteed co-slotted with `k`,
+which makes it legal in `SINTER` and Lua, and makes coverage structural: every node
+owns at least one slot, every slot has a canonical key, therefore every node has
+one. Resharding maintains it for free, with no republish and no client change.
+
+Costs 16384 replicas, so it suits small values; for high-churn sets, coalesce
+changes into ticks rather than fanning out per event, which makes write cost a
+function of tick rate instead of event rate.
 
 ## Known defects
 
